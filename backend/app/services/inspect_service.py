@@ -7,6 +7,7 @@ from app.config import FIXTURES_DIR
 from app.db import connect
 from app.engines.parse_fixture import parse_jsonl
 from app.engines.rule_engine import decide_disposition, evaluate_row
+from app.modules.rule_waiver_window import active_waivers, apply_waivers
 from app.repositories import batches as batch_repo
 from app.repositories import curated as curated_repo
 from app.repositories import datasets as dataset_repo
@@ -28,29 +29,58 @@ def run_inspect(dataset_id: int) -> dict[str, Any]:
         rows = parse_jsonl(path)
         rules = [r for r in rules_repo.list_rules(conn, dataset_id) if r.get("enabled")]
 
+        # 批次开始时刻：整批复用同一个 now 和同一份豁免快照，
+        # 检到一半改钟 / 改豁免配置都不影响本批口径。
+        batch_start = _now()
+        waivers = active_waivers(conn, dataset_id, batch_start)
+        waiver_ids = {w["id"] for w in waivers}
+
         scanned = len(rows)
         passed = failed = quarantined = released = 0
+        waived_rows = 0
+        waived_hit_count = 0
+        waived_audit: list[dict[str, Any]] = []
         row_results: list[dict[str, Any]] = []
-        now = _now()
 
         # pre-insert batch shell with zeros; update via rewrite after we know counts
         # simpler: compute in memory then insert once
         for idx, payload in enumerate(rows, start=1):
-            hits = evaluate_row(payload, rules)
-            disposition = decide_disposition(hits)
+            # 先按全部启用规则求值（规则不因豁免而停用），再压过有效期内的命中
+            raw_hits = evaluate_row(payload, rules)
             entity_key = str(payload.get("entity_key") or "") or None
+            effective_hits, waived_hits = apply_waivers(raw_hits, entity_key, waivers)
+            # 裁决只看仍生效的命中；被豁免的 error 不再触发隔离
+            disposition = decide_disposition(effective_hits)
             if disposition == "quarantine":
                 quarantined += 1
                 failed += 1
             else:
                 passed += 1
+            if waived_hits:
+                waived_rows += 1
+                waived_hit_count += len(waived_hits)
+                for h in waived_hits:
+                    waived_audit.append(
+                        {
+                            "row_no": idx,
+                            "entity_key": entity_key,
+                            "rule_id": h["rule_id"],
+                            "rule_name": h["name"],
+                            "severity": h["severity"],
+                            "detail": h["detail"],
+                            "waiver_id": h["waiver_id"],
+                        }
+                    )
+            # 行清单保留全部命中（含 waived 标记），被豁免的命中仍可审计
+            all_hits = [*waived_hits, *effective_hits]
             row_results.append(
                 {
                     "row_no": idx,
                     "entity_key": entity_key,
                     "payload": payload,
                     "disposition": disposition,
-                    "rule_hits": hits,
+                    "rule_hits": all_hits,
+                    "waived_hits": waived_hits,
                 }
             )
 
@@ -74,6 +104,25 @@ def run_inspect(dataset_id: int) -> dict[str, Any]:
                 "failed": failed,
                 "quarantined": quarantined,
                 "released": 0,
+                "waived_rows": waived_rows,
+                "waived_hits": waived_hit_count,
+            },
+            "waiver": {
+                "effective_at": batch_start,
+                "active_waivers": [
+                    {
+                        "id": w["id"],
+                        "rule_id": w["rule_id"],
+                        "entity_key": w["entity_key"],
+                        "starts_at": w["starts_at"],
+                        "ends_at": w["ends_at"],
+                        "note": w["note"],
+                    }
+                    for w in waivers
+                ],
+                "waived_rows": waived_rows,
+                "waived_hit_count": waived_hit_count,
+                "waived_hits": waived_audit,
             },
             "checks": checks,
         }
@@ -87,7 +136,7 @@ def run_inspect(dataset_id: int) -> dict[str, Any]:
             quarantined=quarantined,
             released=0,
             report=report,
-            created_at=now,
+            created_at=batch_start,
         )
 
         for item in row_results:
@@ -102,7 +151,9 @@ def run_inspect(dataset_id: int) -> dict[str, Any]:
             )
             if item["disposition"] == "quarantine":
                 reasons = "; ".join(
-                    f"{h['name']}:{h['detail']}" for h in item["rule_hits"] if h.get("severity") == "error"
+                    f"{h['name']}:{h['detail']}"
+                    for h in item["rule_hits"]
+                    if h.get("severity") == "error" and not h.get("waived")
                 )
                 quarantine_repo.insert(
                     conn,
@@ -112,7 +163,7 @@ def run_inspect(dataset_id: int) -> dict[str, Any]:
                     entity_key=item["entity_key"],
                     reason=reasons or "rule hit",
                     payload=item["payload"],
-                    created_at=now,
+                    created_at=batch_start,
                 )
             else:
                 # pass rows auto-release to curated (base chain)
@@ -123,7 +174,7 @@ def run_inspect(dataset_id: int) -> dict[str, Any]:
                     batch_id=batch_id,
                     entity_key=key,
                     payload=item["payload"],
-                    released_at=now,
+                    released_at=batch_start,
                 )
                 released += 1
 
@@ -142,6 +193,46 @@ def run_inspect(dataset_id: int) -> dict[str, Any]:
                 "detail": "quarantine rows persisted for this and prior batches",
             }
         )
+
+        # 互证：从已落库的行清单/隔离表回算，与报告豁免数、隔离数对账
+        persisted_rows = batch_repo.list_batch_rows(conn, batch_id)
+        persisted_waived_hits = sum(
+            1 for r in persisted_rows for h in r["rule_hits"] if h.get("waived")
+        )
+        persisted_waived_rows = sum(
+            1 for r in persisted_rows if any(h.get("waived") for h in r["rule_hits"])
+        )
+        referenced_waiver_ids = {
+            h["waiver_id"]
+            for r in persisted_rows
+            for h in r["rule_hits"]
+            if h.get("waived")
+        }
+        batch_quarantine = conn.execute(
+            "SELECT COUNT(*) AS c FROM quarantine WHERE batch_id=?", (batch_id,)
+        ).fetchone()["c"]
+        report["checks"].append(
+            {
+                "name": "quarantine_batch_matches",
+                "ok": batch_quarantine == quarantined,
+                "detail": f"quarantine table for batch({batch_quarantine}) = report quarantined({quarantined})",
+            }
+        )
+        report["checks"].append(
+            {
+                "name": "waiver_audit_matches",
+                "ok": (
+                    persisted_waived_hits == waived_hit_count
+                    and persisted_waived_rows == waived_rows
+                    and referenced_waiver_ids <= waiver_ids
+                ),
+                "detail": (
+                    f"row-list waived hits({persisted_waived_hits}) = report({waived_hit_count}); "
+                    f"waived rows({persisted_waived_rows}) = report({waived_rows}); "
+                    f"all waiver ids trace back to batch-start snapshot"
+                ),
+            }
+        )
         conn.execute(
             """
             UPDATE inspect_batches
@@ -154,7 +245,7 @@ def run_inspect(dataset_id: int) -> dict[str, Any]:
 
         detail = batch_repo.get_batch(conn, batch_id)
         assert detail is not None
-        detail["rows"] = batch_repo.list_batch_rows(conn, batch_id)
+        detail["rows"] = persisted_rows
         detail["curated_total"] = curated_repo.count_all(conn, dataset_id)
         detail["quarantine_total"] = quarantine_repo.count_all(conn)
         return detail

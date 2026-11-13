@@ -78,6 +78,16 @@ def init_db() -> None:
           released_at TEXT NOT NULL,
           UNIQUE(dataset_id, entity_key)
         );
+        CREATE TABLE IF NOT EXISTS rule_waivers(
+          id INTEGER PRIMARY KEY,
+          rule_id INTEGER NOT NULL,
+          entity_key TEXT,
+          starts_at TEXT NOT NULL,
+          ends_at TEXT NOT NULL,
+          note TEXT,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(rule_id) REFERENCES rules(id)
+        );
         """
     )
     n = conn.execute("SELECT COUNT(*) AS c FROM datasets").fetchone()["c"]

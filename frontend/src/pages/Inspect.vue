@@ -44,6 +44,21 @@ async function run() {
         <div class="tile"><div class="hero-num">{{ last.passed_count }}</div><div class="muted">通过</div></div>
         <div class="tile"><div class="hero-num">{{ last.quarantined_count }}</div><div class="muted">隔离</div></div>
         <div class="tile"><div class="hero-num">{{ last.released_count }}</div><div class="muted">签发</div></div>
+        <div class="tile"><div class="hero-num">{{ last.report.counts.waived_hits ?? 0 }}</div><div class="muted">豁免命中（{{ last.report.counts.waived_rows ?? 0 }} 行）</div></div>
+      </div>
+      <div class="panel" v-if="last.report.waiver?.active_waivers?.length" style="margin-bottom:12px">
+        <h4>本批生效豁免（判定时刻 {{ last.report.waiver.effective_at }}）</h4>
+        <table>
+          <thead><tr><th>豁免单</th><th>规则</th><th>实体键</th><th>有效期</th></tr></thead>
+          <tbody>
+            <tr v-for="w in last.report.waiver.active_waivers" :key="w.id">
+              <td>#{{ w.id }}</td>
+              <td>规则 {{ w.rule_id }}</td>
+              <td><code v-if="w.entity_key">{{ w.entity_key }}</code><span v-else class="tag">全部实体</span></td>
+              <td class="muted">{{ w.starts_at }} → {{ w.ends_at }}{{ w.note ? `（${w.note}）` : '' }}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
       <h4>对账</h4>
       <table>
@@ -64,10 +79,33 @@ async function run() {
             <td>{{ r.row_no }}</td>
             <td>{{ r.entity_key }}</td>
             <td><span class="tag" :class="r.disposition === 'pass' ? 'ok' : 'danger'">{{ r.disposition }}</span></td>
-            <td class="muted">{{ r.rule_hits.map(h => h.name).join('；') || '—' }}</td>
+            <td class="muted">
+              <template v-if="r.rule_hits.length">
+                <span v-for="(h, i) in r.rule_hits" :key="i">
+                  <span :class="h.waived ? 'tag ok' : ''">{{ h.name }}<template v-if="h.waived">（豁免 #{{ h.waiver_id }}）</template></span><template v-if="i < r.rule_hits.length - 1">；</template>
+                </span>
+              </template>
+              <template v-else>—</template>
+            </td>
           </tr>
         </tbody>
       </table>
+      <div class="panel" v-if="last.report.waiver?.waived_hits?.length" style="margin-top:12px">
+        <h4>被豁免命中审计（{{ last.report.waiver.waived_hit_count }} 条）</h4>
+        <table>
+          <thead><tr><th>行号</th><th>实体键</th><th>规则</th><th>严重度</th><th>明细</th><th>豁免单</th></tr></thead>
+          <tbody>
+            <tr v-for="(h, i) in last.report.waiver.waived_hits" :key="i">
+              <td>{{ h.row_no }}</td>
+              <td><code>{{ h.entity_key }}</code></td>
+              <td>{{ h.rule_name }}</td>
+              <td><span class="tag" :class="h.severity === 'error' ? 'danger' : ''">{{ h.severity }}</span></td>
+              <td class="muted">{{ h.detail }}</td>
+              <td>#{{ h.waiver_id }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 </template>
